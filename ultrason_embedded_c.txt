@@ -1,0 +1,315 @@
+#include <avr/io.h>
+#include <util/delay.h>
+#include <avr/interrupt.h>
+#include <stdlib.h>
+#include <stdio.h>
+#define FOSC 16000000UL
+#define BAUD 9600
+#define MYUBRR (FOSC/16/BAUD)-1
+#define Trig1 4
+#define Echo1 2
+#define Trig2 7
+#define Echo2 8
+#define vitesse 200
+#define cas12 6.5 // cas 1 ultrason avant
+#define cas11 9.0 // cas 1 ultrason gauche
+#define cas21 34.0 // cas 2 pour gauche
+static volatile uint16_t val1 = 0;
+static volatile uint16_t val2 = 0;
+static volatile uint16_t pulse1 = 0;
+static volatile uint16_t t00 = 0;
+static volatile uint16_t t01 = 0;
+static char displayDist1 [50];
+static volatile uint16_t pulse2 = 0;
+static char displayDist2 [50];
+
+/****************************** INITALIZE PORTS, TIMER, AND INTURRUPTIONS *********************/
+
+void init(){
+  
+  DDRD &=~(1<<Echo1);
+  DDRD |=(1<<Trig1);
+  DDRD &=~(1<<Echo2);
+  DDRD |=(1<<Trig2);
+  /************ INIT USART ***************/
+  
+  UBRR0H=(MYUBRR>>8);
+  UBRR0L=MYUBRR; // BAUD rate
+  UCSR0B=(1<<RXEN0) | (1<<TXEN0);//enable T and R
+  UCSR0C=(1<<USBS0) | (3<<UCSZ00); //2 stop bit and 8 bit data
+  
+  /*********** INIT Counter1 ***********/
+  
+    PRR &= ~(1<<PRTIM1);          // To activate timer1 module
+    TCNT1 = 0;                   // Initial timer value
+    TCCR1A |= (1<<COM1A0); 
+    TCCR1B |= (1 << WGM12);    // CTC mode 
+    
+    // initialize compare value
+    OCR1A = 0xF000;
+    TIMSK1 |= (1<<OCIE1A);
+    //prescaler = 64 and CTC mode
+    TCCR1B |= (1<<CS11);
+
+   /*********** INIT MOTOR ***************/
+    
+    // configure for inverted PWM output on motor control pins:
+    //  set OCxx on compare match, clear on timer overflow
+    //  inverting mode, fast pwm
+    //  Timer0 and Timer2 count up from 0 to 255
+    
+    TCCR0A = TCCR2A = 0xF3;
+ 
+    // use the system clock/8 (=2.5 MHz) as the timer clock
+    TCCR0B = TCCR2B = 0x02;
+ 
+    // initialize all PWMs to 0% duty cycle (braking)
+    OCR0A = OCR0B = OCR2A = OCR2B = 0;
+ 
+    // set PWM pins as digital outputs (the PWM signals will not
+    // appear on the lines if they are digital inputs)
+    DDRD |= (1 << PORTD3) | (1 << PORTD5) | (1 << PORTD6);
+    DDRB |= (1 << PORTB3);
+    
+  /*********** INIT PCINT18 **************/
+  
+  PCICR = 0x05;
+  PCMSK2 |=(1<<PCINT18);
+  PCMSK0 |=(1<<PCINT0);
+  sei();
+ 
+}
+
+/************************** USART Functions *******************************/
+
+void USART_Transmit(unsigned char data){
+  while(!(UCSR0A & (1<<UDRE0))); //Passe à 1 lorsque la donnée est en phase d'émission
+  UDR0 = data; 
+}
+
+/*unsigned char USART_Receiver(){
+  while(!(UCSR0A & (1<<RXC0))); //Passe à 1 lorsque le tompon de réception contient la donnée 
+  return UDR0;
+}*/
+
+void sendStringg(char* stringptr){
+  while(*stringptr!=0x00){
+    USART_Transmit(*stringptr);
+    stringptr++;
+  }
+}
+
+/*************************************** Timer 1 test ***************************************/
+
+/*void timer1_test(){
+     
+    while(1){
+      pulse=TCNT1;
+      sendStringg("Timer1 : ");
+      itoa(pulse,show,10);//10 est la base
+      sendStringg(show);
+      sendStringg("\n");
+    
+    }
+  
+}*/
+
+/******************************** ftoa() : Convert Double to String *************************************/
+
+void reverse(char *str, int len)
+{
+    int i=0, j=len-1, temp;
+    while (i<j)
+    {
+        temp = str[i];
+        str[i] = str[j];
+        str[j] = temp;
+        i++; j--;
+    }
+}
+ 
+ // Converts a given integer x to string str[].  d is the number
+ // of digits required in output. If d is more than the number
+ // of digits in x, then 0s are added at the beginning.
+int intToStr(int x, char str[], int d)
+{
+    int i = 0;
+    while (x)
+    {
+        str[i++] = (x%10) + '0';
+        x = x/10;
+    }
+ 
+    // If number of digits required is more, then
+    // add 0s at the beginning
+    while (i < d)
+        str[i++] = '0';
+ 
+    reverse(str, i);
+    str[i] = '\0';
+    return i;
+}
+ 
+// Converts a floating point number to string.
+void ftoa(float n, char *res, int afterpoint)
+{
+    // Extract integer part
+    int ipart = (int)n;
+ 
+    // Extract floating part
+    float fpart = n - (float)ipart;
+ 
+    // convert integer part to string
+    int i = intToStr(ipart, res, 0);
+ 
+    // check for display option after point
+    if (afterpoint != 0)
+    {
+        res[i] = '.';  // add dot
+ 
+        // Get the value of fraction part upto given no.
+        // of points after dot. The third parameter is needed
+        // to handle cases like 233.007
+        fpart = fpart * pow(10, afterpoint);
+ 
+        intToStr((int)fpart, res + i + 1, afterpoint);
+    }
+}
+
+/**************************************************** Motor Controler *********************************************/
+
+// MOTOR 1 : PIN 5 (PORTD5=OC0B) AND 6 (PORTD6=OC0A)
+// MOTOR 2 : PIN 3 (PORTD3=OC2B) AND 11 (PORTB3=OC2A)
+
+
+void M1_reverse(unsigned char pwm)
+{
+  OCR0A = pwm;
+  OCR0B = 0;
+}
+ 
+void M1_forward(unsigned char pwm)
+{
+  OCR0A = 0;
+  OCR0B = pwm; 
+}
+ 
+void M2_reverse(unsigned char pwm)
+{
+  OCR2A = pwm;
+  OCR2B = 0;
+}
+ 
+void M2_forward(unsigned char pwm)
+{  
+  OCR2A = 0;
+  OCR2B = pwm;
+}
+
+
+/****************************************** MAIN ***********************************************/
+ 
+int main() {
+
+  double dist0 = 300.0;
+  double distance1 = 0; //gauche
+  double distance2 = 0;   // avant
+  init();
+ 
+  while(1){
+     
+  /************* Transmit wave ***********/
+    
+    PORTD &=~(1<<Trig1);
+    PORTD &=~(1<<Trig2);
+    _delay_us(2);
+    PORTD|=(1<<Trig1);
+    PORTD|=(1<<Trig2);
+    _delay_us(10);
+    // t00++;
+    PORTD &=~(1<<Trig1); // Stop the trig
+    PORTD &=~(1<<Trig2);
+       
+    //TCNT1=0;
+    //TCCR1B |= (1<<CS11);
+  
+  /************** Calcul distance ***********/
+
+    distance1 = (pulse1*0.034)/2; 
+    distance2 = (pulse2*0.034)/2;
+
+  /**************** Display on terminal ***************************/
+    
+    distance1 = distance1/2;
+    distance2 = distance2/2;
+    /********** Tester les ultrasons *****************/
+       
+    /*sendStringg("distance1 : "); // gauche
+    ftoa(distance1, displayDist1, 2);
+    sendStringg(displayDist1);
+    sendStringg("\n");*/
+    sendStringg("distance2 : "); // avant
+    ftoa(distance2, displayDist2, 2);
+    sendStringg(displayDist2);
+    sendStringg("\n");
+    M1_forward(vitesse); 
+    M2_forward(vitesse); 
+   if(distance2<cas12){ 
+        M1_forward(vitesse);  
+        M2_reverse(vitesse);
+        _delay_ms(30000);
+        // distance front sensor < 5cm
+      //M1_forward(0);  
+      //M2_forward(0);
+      //sendStringg("Stop avant !");
+    }
+  /*  else if(distance1>cas21){ //distance left sensor > 24cm  : prb is here
+        M1_forward(vitesse);  
+        M2_reverse(vitesse);
+        
+         _delay_us(3000);
+         M1_forward(0);  
+         M2_reverse(0);
+       //sendStringg("Tourner droite !");
+    }
+    else{ //moving forward
+      /*sendStringg("distance1 : "); // avant
+        ftoa(distance1, displayDist1, 2);
+        sendStringg(displayDist1);
+        sendStringg("\n");*/
+      //sendStringg("stop !"); */
+       //M1_forward(vitesse); 
+     //  M2_forward(vitesse); 
+   // }
+    
+  //sendStringg("\n");
+  
+  }
+  return 0;
+}
+
+/******************************* PCINT2 Interruption ****************************/
+
+ISR(PCINT0_vect)
+{
+    //sendStringg("ultra 2 : ");
+    pulse2 = ((TCNT1+val2)-t01);
+    t01 = TCNT1; // Take duration
+    val2=0;
+    
+}
+
+ISR(PCINT2_vect)
+{
+
+    pulse1=((TCNT1+val1)-t00);
+    t00 = TCNT1; // Take duration
+    val1=0;
+    
+}
+
+ISR(TIMER1_COMPA_vect){ // if TCNT1 = OCR1A
+    val1 = OCR1A;
+    val2 = OCR1A;
+}
+
